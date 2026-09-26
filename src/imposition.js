@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 /**
  * 骑马钉（saddle-stitch）小册子拼版核心逻辑。
  *
@@ -550,6 +552,147 @@ function validateImposition(raw) {
   return { valid, errors, slotErrors };
 }
 
+/* ---------- 修复方案 ---------- */
+
+/** 稳定序列化（对象键名排序后拼接），用于计算状态指纹 */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+/** 规范化状态的内容指纹：页码、空白、分帖结构或爬移参数的任何改动都会改变指纹 */
+function stateFingerprint(state) {
+  return crypto.createHash('sha256').update(stableStringify(state), 'utf8').digest('hex');
+}
+
+/** 按版位引用（sig 为 null 表示单帖）在原始状态上写入页码；调用前结构已通过 normalizeState 校验 */
+function writeRawSlot(raw, ref, value) {
+  const sheets = ref.sig == null ? raw.sheets : raw.signatures[ref.sig - 1].sheets;
+  sheets[ref.sheet - 1][ref.side][ref.pos] = value;
+}
+
+/**
+ * 生成修复方案：以服务端标准拼版为目标，给出把当前状态修复为标准拼版的有序步骤。
+ *
+ * 版位按固定顺序处理：帖号（单帖视为唯一一帖）→ 帖内纸张序号 → 面（正/反）→ 版位（左/右）。
+ * 步骤分两类，先交换后改值：
+ *  - swap 交换：目标页在当前状态中恰好出现一次（唯一来源）时，与来源版位交换归位；
+ *    交换不改变各页码的出现次数，交换环按固定版位顺序逐步拆解，每步归位当前版位；
+ *  - set 改值：缺页、重复页、越界页与空白错位等无法交换归位的版位，直接改为目标值。
+ *
+ * 按顺序执行全部步骤后状态即为标准拼版（必通过 validateImposition）。
+ * 每个步骤用 changes 列出受影响版位及其原值 / 目标值（swap 为两个版位，set 为一个）。
+ * fingerprint 为当前状态指纹：生成方案后拼版再被改动时，applyRepair 将拒绝应用旧方案。
+ * 结构非法返回 null。
+ */
+function planRepair(raw) {
+  const state = normalizeState(raw);
+  if (!state) return null;
+  const multi = state.mode === 'multi';
+
+  // 服务端标准拼版：参数（页数 / 每帖纸张数 / 爬移补偿）与当前状态一致
+  const target = generateImposition(
+    state.pages,
+    multi ? state.sheetsPerSignature : null,
+    state.creep
+  );
+
+  // 固定版位顺序展开当前值与目标值
+  const groups = multi ? state.signatures : [{ sig: null, sheets: state.sheets }];
+  const targetGroups = multi ? target.signatures : [{ sheets: target.sheets }];
+  const slots = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    for (let si = 0; si < groups[gi].sheets.length; si++) {
+      const sheet = groups[gi].sheets[si];
+      const targetSheet = targetGroups[gi].sheets[si];
+      for (const side of SIDES) {
+        for (const pos of POSITIONS) {
+          slots.push({
+            ref: { sig: multi ? sheet.sig : null, sheet: sheet.index, side, pos },
+            cur: sheet[side][pos],
+            tgt: targetSheet[side][pos],
+          });
+        }
+      }
+    }
+  }
+
+  const cur = slots.map((s) => s.cur);
+  const tgt = slots.map((s) => s.tgt);
+  const steps = [];
+
+  // 各页码出现次数（交换不改变多重集合，交换阶段内计数恒定）与唯一来源页码的位置
+  const count = new Map();
+  for (const v of cur) count.set(v, (count.get(v) || 0) + 1);
+  const posOf = new Map();
+  cur.forEach((v, i) => {
+    if (count.get(v) === 1) posOf.set(v, i);
+  });
+
+  // 第一阶段：目标页有唯一来源的版位，通过交换归位（交换环按固定版位顺序拆解）
+  for (let i = 0; i < slots.length; i++) {
+    if (cur[i] === tgt[i]) continue;
+    const v = tgt[i];
+    if (v === null || count.get(v) !== 1) continue; // 目标空白 / 缺页 / 重复页：改值阶段处理
+    const j = posOf.get(v); // 来源版位必然也未归位（已归位的版位不会再被交换触碰）
+    steps.push({
+      type: 'swap',
+      changes: [
+        { slot: slots[i].ref, from: cur[i], to: v },
+        { slot: slots[j].ref, from: v, to: cur[i] },
+      ],
+    });
+    const w = cur[i];
+    cur[i] = v;
+    cur[j] = w;
+    posOf.set(v, i);
+    if (count.get(w) === 1) posOf.set(w, j);
+  }
+
+  // 第二阶段：剩余版位（缺页、重复页、越界页、空白错位）直接改为目标值
+  for (let i = 0; i < slots.length; i++) {
+    if (cur[i] === tgt[i]) continue;
+    steps.push({
+      type: 'set',
+      changes: [{ slot: slots[i].ref, from: cur[i], to: tgt[i] }],
+    });
+    cur[i] = tgt[i];
+  }
+
+  return {
+    valid: validateImposition(raw).valid,
+    stepCount: steps.length,
+    steps,
+    fingerprint: stateFingerprint(state),
+  };
+}
+
+/**
+ * 应用修复方案：核对状态指纹（生成方案后拼版被改动则拒绝），重新推导确定性步骤并应用。
+ * 返回 null：结构非法；{ stale, fingerprint }：指纹不符（拼版已改动，需重新生成方案）；
+ * 成功：{ state, validation, steps }，state 为修复后的完整状态（保留提交时的分帖结构与爬移参数）。
+ */
+function applyRepair(raw, fingerprint) {
+  const state = normalizeState(raw);
+  if (!state) return null;
+  const actual = stateFingerprint(state);
+  if (fingerprint !== actual) {
+    return { stale: true, fingerprint: actual };
+  }
+  const plan = planRepair(raw); // 确定性推导：与生成方案时的步骤一致
+  const next = JSON.parse(JSON.stringify(raw));
+  for (const step of plan.steps) {
+    for (const change of step.changes) {
+      writeRawSlot(next, change.slot, change.to);
+    }
+  }
+  const validation = validateImposition(next);
+  if (!validation || !validation.valid) return { error: '修复结果未通过校验' };
+  return { state: next, validation, steps: plan.steps };
+}
+
 /* ---------- 双面打样 HTML ---------- */
 
 /** 四角对位标（十字套圆）：正背面画在同一物理位置，双面打印透光应重合，用于套准检查 */
@@ -773,6 +916,8 @@ module.exports = {
   generateImposition,
   normalizeState,
   validateImposition,
+  planRepair,
+  applyRepair,
   buildCsv,
   buildProofHtml,
 };

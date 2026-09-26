@@ -7,6 +7,8 @@ const {
   MAX_SHEETS_PER_SIGNATURE,
   generateImposition,
   validateImposition,
+  planRepair,
+  applyRepair,
   buildCsv,
   buildProofHtml,
 } = require('./src/imposition');
@@ -46,6 +48,31 @@ app.post('/api/validate', (req, res) => {
   const result = validateImposition(req.body);
   if (!result) {
     return res.status(400).json({ error: '拼版数据格式不正确' });
+  }
+  res.json(result);
+});
+
+/** 生成修复方案：以服务端标准拼版为目标，返回按顺序执行的交换 / 改值步骤与状态指纹 */
+app.post('/api/repair/plan', (req, res) => {
+  const plan = planRepair(req.body);
+  if (!plan) {
+    return res.status(400).json({ error: '拼版数据格式不正确' });
+  }
+  res.json(plan);
+});
+
+/** 应用修复方案：指纹不符（生成方案后拼版又被改动）时拒绝并返回 409 */
+app.post('/api/repair/apply', (req, res) => {
+  const body = req.body || {};
+  const result = applyRepair(body.state, body.fingerprint);
+  if (!result) {
+    return res.status(400).json({ error: '拼版数据格式不正确' });
+  }
+  if (result.stale) {
+    return res.status(409).json({ error: '拼版已在生成修复方案后被改动，请重新生成修复方案' });
+  }
+  if (result.error) {
+    return res.status(500).json({ error: result.error });
   }
   res.json(result);
 });
