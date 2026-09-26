@@ -4,6 +4,13 @@ const els = {
   pagesInput: document.getElementById('pagesInput'),
   generateBtn: document.getElementById('generateBtn'),
   resetBtn: document.getElementById('resetBtn'),
+  repairPlanBtn: document.getElementById('repairPlanBtn'),
+  repairCard: document.getElementById('repairCard'),
+  repairSummary: document.getElementById('repairSummary'),
+  repairSteps: document.getElementById('repairSteps'),
+  repairStale: document.getElementById('repairStale'),
+  applyRepairBtn: document.getElementById('applyRepairBtn'),
+  discardRepairBtn: document.getElementById('discardRepairBtn'),
   exportBtn: document.getElementById('exportBtn'),
   proofBtn: document.getElementById('proofBtn'),
   singleModeBtn: document.getElementById('singleModeBtn'),
@@ -39,6 +46,7 @@ let layout = 'single'; // 拼版模式：'single' | 'multi'
 let mode = 'swap'; // 操作模式：'swap' | 'edit'
 let selected = null; // 交换模式下已选中的版位 { sig, sheet, side, pos }
 let validateTimer = null;
+let repairPlan = null; // 当前修复方案 { valid, steps, fingerprint, stale? }
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -47,7 +55,11 @@ async function api(path, body) {
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
+  if (!res.ok) {
+    const err = new Error(data.error || `请求失败（HTTP ${res.status}）`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -89,11 +101,13 @@ function setLayout(next) {
     state = null;
     original = null;
     selected = null;
+    clearRepairPlan();
     els.sheets.innerHTML = '';
     els.emptyTip.hidden = false;
     els.nestTip.hidden = true;
     els.summary.textContent = '';
     els.resetBtn.disabled = true;
+    els.repairPlanBtn.disabled = true;
     els.exportBtn.disabled = true;
     els.proofBtn.disabled = true;
     els.errors.innerHTML = '<p class="muted">已切换拼版模式，请重新点击「生成拼版」。</p>';
@@ -129,6 +143,7 @@ async function generate() {
     state = data;
     original = structuredClone(data);
     selected = null;
+    clearRepairPlan();
     render();
     scheduleValidate();
   } catch (e) {
@@ -140,6 +155,7 @@ function reset() {
   if (!original) return;
   state = structuredClone(original);
   selected = null;
+  markRepairStale(); // 拼版已改动，旧修复方案不再适用
   render();
   scheduleValidate();
 }
@@ -178,6 +194,7 @@ function render() {
   }
 
   els.resetBtn.disabled = false;
+  els.repairPlanBtn.disabled = false;
   updateModeUI();
 }
 
@@ -312,6 +329,7 @@ function onSlotClick(ref, el) {
   setSlot(selected, getSlot(ref));
   setSlot(ref, tmp);
   selected = null;
+  markRepairStale(); // 拼版已改动，旧修复方案不再适用
   render();
   scheduleValidate();
 }
@@ -348,6 +366,7 @@ function openEditor(ref, el) {
 
   const commit = (value) => {
     setSlot(ref, value);
+    markRepairStale(); // 拼版已改动，旧修复方案不再适用
     render();
     scheduleValidate();
   };
@@ -487,6 +506,139 @@ function markSlotErrors(slotErrors) {
   }
 }
 
+/* ---------- 修复方案 ---------- */
+
+/** 版位描述：分帖模式带帖号 */
+function slotLabel(ref) {
+  const parts = [];
+  if (ref.sig != null) parts.push(`第 ${ref.sig} 帖`);
+  parts.push(`第 ${ref.sheet} 张纸`, `${SIDE_LABEL[ref.side]}${POS_LABEL[ref.pos]}`);
+  return parts.join(' · ');
+}
+
+/** 版位值描述：页码或空白 */
+function valueLabel(v) {
+  return v === null ? '空白' : `第 ${v} 页`;
+}
+
+/** 生成修复方案：以服务端标准拼版为目标，返回有序交换/改值步骤 */
+async function generateRepairPlan() {
+  if (!state) return;
+  try {
+    const plan = await api('/api/repair/plan', state);
+    repairPlan = plan;
+    els.repairCard.classList.remove('stale');
+    renderRepairPlan();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+function renderRepairPlan() {
+  if (!repairPlan) return;
+  els.repairCard.hidden = false;
+  els.repairStale.hidden = !repairPlan.stale;
+  els.repairSteps.innerHTML = '';
+  if (repairPlan.valid) {
+    els.repairSummary.textContent = '当前拼版已通过校验，无需修复。';
+    els.applyRepairBtn.disabled = true;
+    return;
+  }
+  const swaps = repairPlan.steps.filter((s) => s.type === 'swap').length;
+  const sets = repairPlan.steps.length - swaps;
+  els.repairSummary.textContent =
+    `以标准拼版为目标，共 ${repairPlan.steps.length} 步` +
+    `（交换 ${swaps} 步、改值 ${sets} 步），按顺序执行：`;
+  els.applyRepairBtn.disabled = Boolean(repairPlan.stale) || repairPlan.steps.length === 0;
+  for (const step of repairPlan.steps) {
+    els.repairSteps.appendChild(renderRepairStep(step));
+  }
+}
+
+function renderRepairStep(step) {
+  const li = document.createElement('li');
+  li.className = `repair-step ${step.type}`;
+
+  const head = document.createElement('div');
+  head.className = 'repair-step-head';
+  const badge = document.createElement('span');
+  badge.className = `repair-badge ${step.type}`;
+  badge.textContent = step.type === 'swap' ? '交换' : '改值';
+  const title = document.createElement('span');
+  title.className = 'repair-title';
+  title.textContent = step.type === 'swap'
+    ? `${slotLabel(step.a)} ↔ ${slotLabel(step.b)}`
+    : slotLabel(step.slot);
+  head.append(badge, title);
+  li.appendChild(head);
+
+  const changes = document.createElement('div');
+  changes.className = 'repair-changes';
+  if (step.type === 'swap') {
+    changes.append(
+      changeLine(step.a, step.aFrom, step.aTo),
+      changeLine(step.b, step.bFrom, step.bTo)
+    );
+  } else {
+    changes.appendChild(changeLine(step.slot, step.from, step.to));
+  }
+  li.appendChild(changes);
+  return li;
+}
+
+/** 一步中某个版位的取值变化：版位：原值 → 目标值 */
+function changeLine(ref, from, to) {
+  const div = document.createElement('div');
+  div.className = 'repair-change';
+  const slot = document.createElement('span');
+  slot.className = 'repair-slot';
+  slot.textContent = `${slotLabel(ref)}：`;
+  const fromEl = document.createElement('span');
+  fromEl.className = 'from';
+  fromEl.textContent = valueLabel(from);
+  const arrow = document.createElement('span');
+  arrow.className = 'arrow';
+  arrow.textContent = '→';
+  const toEl = document.createElement('span');
+  toEl.className = 'to';
+  toEl.textContent = valueLabel(to);
+  div.append(slot, fromEl, arrow, toEl);
+  return div;
+}
+
+/** 拼版被改动后：旧方案置为失效（拒绝应用，提示重新生成） */
+function markRepairStale() {
+  if (!repairPlan || repairPlan.stale) return;
+  repairPlan.stale = true;
+  els.repairCard.classList.add('stale');
+  els.repairStale.hidden = false;
+  els.applyRepairBtn.disabled = true;
+}
+
+function clearRepairPlan() {
+  repairPlan = null;
+  els.repairCard.hidden = true;
+  els.repairCard.classList.remove('stale');
+  els.repairStale.hidden = true;
+  els.repairSteps.innerHTML = '';
+}
+
+/** 一键应用：服务端核对状态指纹后按步骤修复，返回的修复后状态直接替换当前拼版 */
+async function applyRepairPlan() {
+  if (!repairPlan || repairPlan.stale || !state) return;
+  try {
+    const result = await api('/api/repair/apply', { state, fingerprint: repairPlan.fingerprint });
+    state = result.state;
+    selected = null;
+    clearRepairPlan();
+    render();
+    scheduleValidate();
+  } catch (e) {
+    if (e.status === 409) markRepairStale(); // 拼版在生成方案后又被改动
+    alert(e.message);
+  }
+}
+
 /* ---------- 导出 ---------- */
 
 /** 下载结果文件（CSV / 打样 HTML）的通用逻辑 */
@@ -531,6 +683,9 @@ function downloadProof() {
 
 els.generateBtn.addEventListener('click', generate);
 els.resetBtn.addEventListener('click', reset);
+els.repairPlanBtn.addEventListener('click', generateRepairPlan);
+els.applyRepairBtn.addEventListener('click', applyRepairPlan);
+els.discardRepairBtn.addEventListener('click', clearRepairPlan);
 els.exportBtn.addEventListener('click', exportCsv);
 els.proofBtn.addEventListener('click', downloadProof);
 els.pagesInput.addEventListener('keydown', (e) => {

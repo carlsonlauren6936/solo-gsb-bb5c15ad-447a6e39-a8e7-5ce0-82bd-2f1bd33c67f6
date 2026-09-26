@@ -9,7 +9,7 @@
 <body>
   <header class="top">
     <h1>骑马钉小册子拼版检查</h1>
-    <p>输入成品页数，自动补齐为 4 的倍数并生成拼版；支持单帖与分帖两种模式，可版位交换与编辑，实时校验重复页、缺页、正反配对异常及跨帖连续性，校验通过后可导出 CSV 或下载双面打样（独立 HTML，A4 横向、每张纸正反各一页、短边翻转镜像，含左右页码、空白版位、中央折线与四角对位标）。可选骑马钉爬移补偿：按单张纸厚度与补偿上限逐张计算补偿量，左版向右、右版向左（朝折线）移动，打样中仅页码内容随补偿平移。</p>
+    <p>输入成品页数，自动补齐为 4 的倍数并生成拼版；支持单帖与分帖两种模式，可版位交换与编辑，实时校验重复页、缺页、正反配对异常及跨帖连续性，校验通过后可导出 CSV 或下载双面打样（独立 HTML，A4 横向、每张纸正反各一页、短边翻转镜像，含左右页码、空白版位、中央折线与四角对位标）。可选骑马钉爬移补偿：按单张纸厚度与补偿上限逐张计算补偿量，左版向右、右版向左（朝折线）移动，打样中仅页码内容随补偿平移。拼版出错时可「生成修复方案」：以标准拼版为目标列出按顺序执行的交换 / 改值步骤（含版位、原值、目标值），一键应用即恢复标准拼版。</p>
   </header>
 
   <main>
@@ -33,6 +33,7 @@
         <input id="creepCapInput" type="number" min="0" max="10" step="0.1" value="2" hidden>
         <button id="generateBtn" class="primary">生成拼版</button>
         <button id="resetBtn" disabled>重置</button>
+        <button id="repairPlanBtn" disabled>生成修复方案</button>
         <span class="spacer"></span>
         <div class="mode-group" role="group" aria-label="操作模式">
           <button id="swapModeBtn" class="mode active" type="button">交换模式</button>
@@ -43,6 +44,18 @@
       </div>
       <p id="modeHint" class="hint"></p>
       <p id="summary" class="summary"></p>
+    </section>
+
+    <section id="repairCard" class="card repair-card" hidden>
+      <header class="repair-head">
+        <h2>修复方案</h2>
+        <span id="repairSummary" class="repair-summary"></span>
+        <span class="spacer"></span>
+        <button id="applyRepairBtn" class="primary" type="button">一键应用</button>
+        <button id="discardRepairBtn" type="button">关闭</button>
+      </header>
+      <p id="repairStale" class="repair-stale" hidden>拼版已在生成方案后改动，本方案不再适用，请重新生成修复方案。</p>
+      <ol id="repairSteps" class="repair-steps"></ol>
     </section>
 
     <div class="layout">

@@ -240,3 +240,53 @@ button.primary:hover:not(:disabled) { background: var(--accent-dark); }
 .err-group strong { color: var(--bad); }
 .err-group ul { margin: 6px 0 2px; padding-left: 18px; }
 .err-group li { margin: 2px 0; }
+
+/* 修复方案面板 */
+.repair-card { margin-top: 18px; }
+.repair-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.repair-head h2 { margin: 0; font-size: 16px; }
+.repair-summary { font-size: 13px; color: var(--muted); }
+.repair-stale {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: var(--bad);
+  background: var(--bad-bg);
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.repair-steps { margin: 12px 0 0; padding-left: 22px; }
+.repair-step { margin-bottom: 12px; }
+.repair-step-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.repair-badge {
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 1px 10px;
+}
+.repair-badge.swap { color: #1d4ed8; background: #eff6ff; border: 1px solid #bfdbfe; }
+.repair-badge.set { color: #92400e; background: #fffbeb; border: 1px solid #fde68a; }
+.repair-title { font-size: 13px; font-weight: 600; }
+.repair-changes { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
+.repair-change {
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.repair-change .from { color: var(--bad); font-weight: 600; }
+.repair-change .to { color: var(--ok); font-weight: 600; }
+.repair-change .arrow { color: var(--muted); }
+.repair-card.stale .repair-steps { opacity: 0.45; }

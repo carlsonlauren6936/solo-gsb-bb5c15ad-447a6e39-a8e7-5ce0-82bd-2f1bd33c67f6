@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 /**
  * 骑马钉（saddle-stitch）小册子拼版核心逻辑。
  *
@@ -21,6 +23,12 @@
  * 每张纸正反面共用同一 c：左版向右（+c）、右版向左（−c），均朝折线移动。
  * 未启用或上限为 0 时不产生任何补偿数据，结果与启用前完全一致；
  * 校验/导出时服务端按参数重算每张纸的补偿值，与提交数据不符即拒绝。
+ *
+ * 修复方案：planRepair 以同参数（页数 / 分帖 / 爬移补偿）的服务端标准拼版为目标，
+ * 生成把当前状态修复为标准拼版的有序步骤——有唯一来源（恰好出现一次）的目标页
+ * 优先交换归位，交换环按固定版位顺序（帖 → 张 → 面 → 左右）拆解；缺页、重复页、
+ * 越界页与空白错位用改值补齐。applyRepair 核对状态指纹（生成方案后拼版被改动即拒绝）
+ * 后按步骤应用；修复结果保留分帖结构与爬移参数，且必通过现有校验。
  */
 
 const SIDES = ['front', 'back'];
@@ -550,6 +558,159 @@ function validateImposition(raw) {
   return { valid, errors, slotErrors };
 }
 
+/* ---------- 修复方案 ---------- */
+
+/** 状态指纹：对规范化后的状态做 SHA-256，用于识别「生成方案后拼版又被改动」 */
+function stateFingerprint(state) {
+  return crypto.createHash('sha256').update(JSON.stringify(state)).digest('hex');
+}
+
+/** 按固定版位顺序（帖 → 张 → 面 → 左右）展开全部版位 */
+function flattenSlots(groups) {
+  const out = [];
+  for (const g of groups) {
+    for (const s of g.sheets) {
+      for (const side of SIDES) {
+        for (const pos of POSITIONS) {
+          out.push({ sig: g.sig ?? null, sheet: s.index, side, pos, value: s[side][pos] });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 生成修复方案：以同参数（页数 / 分帖 / 爬移补偿）的服务端标准拼版为目标，
+ * 返回把当前状态修复为标准拼版的有序步骤。
+ * 第一阶段「交换归位」：目标页在当前拼版中有唯一来源（恰好出现一次）时，
+ * 按固定版位顺序逐一交换归位（交换环随之按版位顺序拆解；交换不改变各页码
+ * 出现次数，故唯一来源在第一阶段恒定）。
+ * 第二阶段「改值补齐」：缺页、重复页、越界页与空白错位直接改写为目标值。
+ * 步骤按顺序执行后状态即为标准拼版，可通过现有校验。
+ * 步骤结构：
+ *   交换 { type: 'swap', a, b, aFrom, aTo, bFrom, bTo }（a 为归位版位，b 为来源版位）
+ *   改值 { type: 'set', slot, from, to }
+ * 版位为 { sheet, side, pos }，分帖模式额外带 sig。
+ * 返回 { valid, steps, fingerprint }；结构非法返回 null。
+ * fingerprint 为当前状态指纹，应用方案时据此拒绝已改动的拼版。
+ */
+function planRepair(raw) {
+  const state = normalizeState(raw);
+  if (!state) return null;
+  const multi = state.mode === 'multi';
+  const groups = multi ? state.signatures : [{ sig: null, sheets: state.sheets }];
+
+  // 目标：同参数的服务端标准拼版
+  const target = multi
+    ? generateImposition(state.pages, state.sheetsPerSignature, state.creep)
+    : generateImposition(state.pages, null, state.creep);
+  const targetGroups = multi ? target.signatures : [{ sig: null, sheets: target.sheets }];
+
+  const curSlots = flattenSlots(groups);
+  const tgtSlots = flattenSlots(targetGroups);
+  const n = curSlots.length;
+  const current = curSlots.map((s) => s.value);
+  const wanted = tgtSlots.map((s) => s.value);
+
+  // 各页码出现次数与唯一来源页码的位置（交换不改变次数，位置随交换更新）
+  const counts = new Map();
+  for (const v of current) {
+    if (v !== null) counts.set(v, (counts.get(v) || 0) + 1);
+  }
+  const loc = new Map();
+  current.forEach((v, i) => {
+    if (v !== null && counts.get(v) === 1) loc.set(v, i);
+  });
+
+  const fixed = current.map((v, i) => v === wanted[i]);
+  const steps = [];
+  const slotRef = (s) => {
+    const ref = { sheet: s.sheet, side: s.side, pos: s.pos };
+    if (multi) ref.sig = s.sig;
+    return ref;
+  };
+
+  // 第一阶段：有唯一来源的目标页优先交换归位（交换环按固定版位顺序拆解）
+  for (let i = 0; i < n; i++) {
+    if (fixed[i]) continue;
+    const t = wanted[i];
+    if (t === null) continue; // 目标为空白：空白错位，留待改值
+    if (counts.get(t) !== 1) continue; // 缺页 / 重复页：无唯一来源，留待改值
+    // t 的唯一来源版位 j：必未归位（否则目标页位置唯一 ⇒ j === i，矛盾）且 j ≠ i
+    const j = loc.get(t);
+    steps.push({
+      type: 'swap',
+      a: slotRef(curSlots[i]),
+      b: slotRef(curSlots[j]),
+      aFrom: current[i],
+      aTo: t,
+      bFrom: t,
+      bTo: current[i],
+    });
+    const passenger = current[i];
+    current[i] = t;
+    current[j] = passenger;
+    fixed[i] = true;
+    loc.set(t, i);
+    if (passenger !== null && counts.get(passenger) === 1) loc.set(passenger, j);
+    if (passenger === wanted[j]) fixed[j] = true; // 二环一步归两位
+  }
+
+  // 第二阶段：缺页、重复页、越界页、空白错位一律改值补齐
+  for (let i = 0; i < n; i++) {
+    if (fixed[i]) continue;
+    steps.push({ type: 'set', slot: slotRef(curSlots[i]), from: current[i], to: wanted[i] });
+    current[i] = wanted[i];
+    fixed[i] = true;
+  }
+
+  return {
+    valid: validateImposition(raw).valid,
+    steps,
+    fingerprint: stateFingerprint(state),
+  };
+}
+
+/**
+ * 应用修复方案：fingerprint 必须与当前状态指纹一致（生成方案后拼版被改动
+ * 则返回 { stale: true }，调用方应提示重新生成）。一致时重算确定性修复步骤
+ * 并应用到状态副本，返回 { state, steps, valid }；修复结果保留分帖结构与
+ * 爬移参数，且必通过现有校验（通不过则抛出异常，属内部错误）。结构非法返回 null。
+ */
+function applyRepair(raw, fingerprint) {
+  const plan = planRepair(raw);
+  if (!plan) return null;
+  if (plan.fingerprint !== fingerprint) return { stale: true };
+
+  const repaired = JSON.parse(JSON.stringify(raw));
+  const multi = Array.isArray(repaired.signatures);
+  const findSheet = (ref) => {
+    if (multi) {
+      const g = repaired.signatures.find((sg) => Number(sg.sig) === Number(ref.sig));
+      return g.sheets.find((s) => Number(s.index) === Number(ref.sheet));
+    }
+    return repaired.sheets[ref.sheet - 1];
+  };
+  for (const step of plan.steps) {
+    if (step.type === 'swap') {
+      const a = findSheet(step.a);
+      const b = findSheet(step.b);
+      const tmp = a[step.a.side][step.a.pos];
+      a[step.a.side][step.a.pos] = b[step.b.side][step.b.pos];
+      b[step.b.side][step.b.pos] = tmp;
+    } else {
+      const s = findSheet(step.slot);
+      s[step.slot.side][step.slot.pos] = step.to;
+    }
+  }
+  const check = validateImposition(repaired);
+  if (!check || !check.valid) {
+    throw new Error('修复结果未通过校验');
+  }
+  return { state: repaired, steps: plan.steps.length, valid: true };
+}
+
 /* ---------- 双面打样 HTML ---------- */
 
 /** 四角对位标（十字套圆）：正背面画在同一物理位置，双面打印透光应重合，用于套准检查 */
@@ -773,6 +934,8 @@ module.exports = {
   generateImposition,
   normalizeState,
   validateImposition,
+  planRepair,
+  applyRepair,
   buildCsv,
   buildProofHtml,
 };
